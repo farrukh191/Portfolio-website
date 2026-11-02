@@ -21,7 +21,7 @@ export default function Hero() {
       <div className="wrap grid">
         <div>
           <div className="status mono"><span className="dot" />Frontend engineer · Open to opportunities</div>
-          <h1>Building thoughtful digital experiences with clean, scalable code.</h1>
+          <h1>Building your thoughtful digital experiences with clean, scalable code.</h1>
           <p className="lead">I’m a frontend developer focused on building reliable, maintainable web applications using React, Vue.js, and modern JavaScript. I enjoy turning complex requirements into reusable UI systems, smooth user experiences, and practical product solutions.</p>
           <div className="cta">
             <a className="btn pri" href="#work">Explore my work</a>
