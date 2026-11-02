@@ -27,8 +27,12 @@ npm run build
 ## Deploy (GitHub -> Vercel)
 1. Push this folder to a GitHub repo (branch `main`).
 2. Vercel: Add New > Project > import the repo. Framework Preset is detected as Next.js; keep the defaults.
-3. Settings > Environment Variables: add `LLM_PROVIDER` and `ANTHROPIC_API_KEY` (or the OpenAI ones). Redeploy after changing them.
+3. Settings > Environment Variables: add `GROQ_API_KEY` (or `GEMINI_API_KEY`). `LLM_PROVIDER` is optional. Redeploy after changing them.
 4. Every push to `main` redeploys. Other branches get preview URLs.
+
+## AI assistant setup check
+Open `http://localhost:3000/api/chat` in the browser. It shows which provider and model are active, or tells you the key is missing. Env files are only read at startup, so restart `npm run dev` after editing `.env.local`.
+Providers: Groq (default), Gemini, OpenAI, Anthropic. If a model is retired, set `GROQ_MODEL` / `GEMINI_MODEL`.
 
 ## Update content
 - Certificates, projects, skills, roles: edit `lib/data.ts`. The AI assistant picks up the same data automatically.

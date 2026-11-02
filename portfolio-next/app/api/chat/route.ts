@@ -11,6 +11,7 @@ const MAX_CHARS = 500;
 const WINDOW_MS = 10 * 60 * 1000;
 const MAX_REQUESTS = 20; // per IP per window (best effort: memory is per serverless instance)
 const hits = new Map<string, number[]>();
+const isDev = process.env.NODE_ENV !== "production";
 
 function limited(ip: string) {
   const now = Date.now();
@@ -35,53 +36,155 @@ function validate(body: unknown): Msg[] | null {
   return out;
 }
 
-type LLMResult = { reply?: string; status?: number; missingKey?: boolean };
+/** Reads an env value safely: trims, removes quotes and inline "# comments", ignores placeholders. */
+function env(name: string): string | undefined {
+  let v = process.env[name];
+  if (!v) return undefined;
+  v = v.replace(/\s+#.*$/, "").trim().replace(/^["']|["']$/g, "").trim();
+  if (!v || /^your_|_here$|^xxx/i.test(v)) return undefined;
+  return v;
+}
 
-async function callLLM(messages: Msg[], signal: AbortSignal): Promise<LLMResult> {
-  const provider = (process.env.LLM_PROVIDER || "anthropic").toLowerCase();
-  if (provider === "openai") {
-    const key = process.env.OPENAI_API_KEY;
-    if (!key) return { missingKey: true };
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+type Provider = {
+  kind: "openai-compatible" | "anthropic";
+  url: string;
+  keyEnv: string;
+  modelEnv: string;
+  model: string;
+  tokenParam?: string;
+  authMode?: "bearer" | "google-key";
+};
+
+const PROVIDERS: Record<string, Provider> = {
+  groq: {
+    kind: "openai-compatible",
+    url: "https://api.groq.com/openai/v1/chat/completions",
+    keyEnv: "GROQ_API_KEY",
+    modelEnv: "GROQ_MODEL",
+    model: "qwen/qwen3.8-27b",
+    tokenParam: "max_completion_tokens",
+  },
+  gemini: {
+    kind: "openai-compatible",
+    url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    keyEnv: "GEMINI_API_KEY",
+    modelEnv: "GEMINI_MODEL",
+    model: "gemini-3.8-flash",
+    tokenParam: "max_tokens",
+    authMode: "google-key",
+  },
+  openai: {
+    kind: "openai-compatible",
+    url: "https://api.openai.com/v1/chat/completions",
+    keyEnv: "OPENAI_API_KEY",
+    modelEnv: "OPENAI_MODEL",
+    model: "gpt-4o-mini",
+    tokenParam: "max_tokens",
+  },
+  anthropic: {
+    kind: "anthropic",
+    url: "https://api.anthropic.com/v1/messages",
+    keyEnv: "ANTHROPIC_API_KEY",
+    modelEnv: "ANTHROPIC_MODEL",
+    model: "claude-haiku-5-5",
+  },
+};
+
+/** Uses LLM_PROVIDER if its key exists, otherwise the first provider that has a key. */
+function pickProvider(): { name: string; cfg: Provider; key: string } | null {
+  const wanted = (env("LLM_PROVIDER") || "").toLowerCase();
+  const order = [wanted, "groq", "gemini", "openai", "anthropic"].filter((n, i, a) => PROVIDERS[n] && a.indexOf(n) === i);
+  for (const name of order) {
+    const key = env(PROVIDERS[name].keyEnv);
+    if (key) return { name, cfg: PROVIDERS[name], key };
+  }
+  return null;
+}
+
+type LLMResult = { reply?: string; status?: number; provider?: string };
+
+function buildRequestUrl(cfg: Provider, key: string) {
+  if (cfg.authMode === "google-key") {
+    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${cfg.model}:generateContent`);
+    url.searchParams.set("key", key);
+    return url.toString();
+  }
+  return cfg.url;
+}
+
+async function callLLM(messages: Msg[], signal: AbortSignal): Promise<LLMResult | null> {
+  const picked = pickProvider();
+  if (!picked) return null;
+  const { name, cfg, key } = picked;
+  const model = env(cfg.modelEnv) || cfg.model;
+
+  if (cfg.kind === "anthropic") {
+    const r = await fetch(cfg.url, {
       method: "POST",
       signal,
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-      body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        max_tokens: 400,
-        temperature: 0.3,
-        messages: [{ role: "system", content: SYSTEM }, ...messages],
-      }),
+      headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model, max_tokens: 400, system: SYSTEM, messages }),
     });
-    if (!r.ok) return { status: r.status };
+    if (!r.ok) return { status: r.status, provider: name };
     const d = await r.json();
-    return { reply: d.choices?.[0]?.message?.content?.trim() };
+    const reply = ((d.content || []) as { type: string; text?: string }[])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+    return { reply, provider: name };
   }
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return { missingKey: true };
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
+
+  if (cfg.authMode === "google-key") {
+    const requestUrl = buildRequestUrl({ ...cfg, model }, key);
+    const requestBody = {
+      systemInstruction: { parts: [{ text: SYSTEM }] },
+      contents: messages.map((m) => ({ role: m.role === "user" ? "user" : "model", parts: [{ text: m.content }] })),
+      generationConfig: { temperature: 0.3, maxOutputTokens: 400 },
+    };
+
+    const r = await fetch(requestUrl, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    if (!r.ok) return { status: r.status, provider: name };
+    const d = await r.json();
+    const reply = d.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text).join("\n").trim();
+    return { reply, provider: name };
+  }
+
+  const requestUrl = cfg.url;
+  const r = await fetch(requestUrl, {
     method: "POST",
     signal,
-    headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
     body: JSON.stringify({
-      model: process.env.ANTHROPIC_MODEL || "claude-haiku-5-5",
-      max_tokens: 400,
-      system: SYSTEM,
-      messages,
+      model,
+      [cfg.tokenParam as string]: 400,
+      temperature: 0.3,
+      messages: [{ role: "system", content: SYSTEM }, ...messages],
     }),
   });
-  if (!r.ok) return { status: r.status };
+  if (!r.ok) return { status: r.status, provider: name };
   const d = await r.json();
-  const reply = ((d.content || []) as { type: string; text?: string }[])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
-  return { reply };
+  return { reply: d.choices?.[0]?.message?.content?.trim(), provider: name };
 }
 
 const json = (body: unknown, status = 200) =>
   Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
+
+/** Setup check: open http://localhost:3000/api/chat in the browser. Never returns keys. */
+export async function GET() {
+  const p = pickProvider();
+  return json({
+    configured: !!p,
+    provider: p?.name ?? null,
+    model: p ? env(p.cfg.modelEnv) || p.cfg.model : null,
+    hint: p ? "Ready." : "No API key found. Add GROQ_API_KEY or GEMINI_API_KEY to .env.local, then restart the dev server.",
+  });
+}
 
 export async function POST(req: Request) {
   const ip = (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() || "unknown";
@@ -95,10 +198,15 @@ export async function POST(req: Request) {
   const timer = setTimeout(() => ctrl.abort(), 20000);
   try {
     const out = await callLLM(messages, ctrl.signal);
-    if (out.missingKey) return json({ error: "AI assistant is not configured." }, 503);
+    if (!out) {
+      return json(
+        { error: "AI assistant is not configured.", ...(isDev && { hint: "Open /api/chat in your browser for a setup check." }) },
+        503
+      );
+    }
     if (out.status) {
-      console.error("LLM provider returned status", out.status);
-      return json({ error: "AI service error." }, 502);
+      console.error(`LLM provider "${out.provider}" returned status ${out.status}`);
+      return json({ error: "AI service error.", ...(isDev && { provider: out.provider, status: out.status }) }, 502);
     }
     if (!out.reply) return json({ error: "Empty response." }, 502);
     return json({ reply: out.reply });

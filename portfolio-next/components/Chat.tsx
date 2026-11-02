@@ -64,6 +64,7 @@ export default function Chat() {
         body: JSON.stringify({ messages: hist.current.slice(-7) }),
       });
       const data = await res.json().catch(() => ({}));
+
       if (!res.ok || !data.reply) throw { code: res.status === 429 ? "rate_limited" : "unavailable" };
       hist.current.push({ role: "assistant", content: data.reply });
       setMsgs((m) => m.map((x) => (x.id === wid ? { ...x, text: data.reply, typing: false } : x)));
